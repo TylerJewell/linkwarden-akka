@@ -20,7 +20,6 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import org.junit.jupiter.api.Test;
 
 /**
  * Runs `linkwarden-port/bench/workloads.json` through this port and writes
@@ -39,7 +38,17 @@ public class BenchmarkRunner {
   private static final String LINK_ID = "L";
   private static final String COLLECTION_ID = "C";
 
-  @Test
+  public static void main(String[] args) throws Exception {
+    new BenchmarkRunner().runBenchmark();
+  }
+
+  /**
+   * Not a test. It asserts nothing about correctness — the comparison is between the two
+   * answer files, not inside either of them — and a class that runs on every build would
+   * rewrite them from a workload file that does not travel with this repository.
+   *
+   * <pre>mvn -q test-compile exec:java -Dexec.classpathScope=test    *   -Dexec.mainClass=io.akka.linkwarden.bench.BenchmarkRunner</pre>
+   */
   public void runBenchmark() throws Exception {
     ArrayNode workloads = (ArrayNode) JSON.readTree(BENCH.resolve("workloads.json").toFile());
     ObjectNode out = JSON.createObjectNode();
