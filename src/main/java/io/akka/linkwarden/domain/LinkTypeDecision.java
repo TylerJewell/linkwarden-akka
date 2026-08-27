@@ -1,6 +1,6 @@
 package io.akka.linkwarden.domain;
 
-/** SPEC-001 R6 — the type and, for an image, the extension its file is written with. */
+/** SPEC-001 R38 — the type and, for an image, the extension its file is written with. */
 public record LinkTypeDecision(LinkType type, String imageExtension) {
 
   public static LinkTypeDecision fromContentType(String contentType) {

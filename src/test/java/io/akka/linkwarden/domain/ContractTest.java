@@ -10,7 +10,7 @@ import java.util.List;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
-/** SPEC-001 §3 as checks, one nested class per rule family. */
+/** SPEC-001 §4 as checks, one nested class per rule family. */
 class ContractTest {
 
   private static final ArchivalSettings ALL_ON =
@@ -401,6 +401,21 @@ class ContractTest {
       assertEquals(Duration.ofSeconds(20), policy.delayBefore(4));
       assertTrue(policy.hasAnotherAttempt(3));
       assertFalse(policy.hasAnotherAttempt(4));
+    }
+  }
+
+  @Nested
+  class UrlsTest {
+    @Test
+    void bothSpellingsOfAUrlAreOffered() {
+      // R35 — a stored url is compared against the proposed one with and without the www.
+      // prefix, whichever of the two the caller happened to send.
+      assertEquals(
+          List.of("https://www.example.com/x", "https://example.com/x"),
+          Urls.duplicateCandidates("https://example.com/x/"));
+      assertEquals(
+          List.of("https://www.example.com/x", "https://example.com/x"),
+          Urls.duplicateCandidates("https://www.example.com/x"));
     }
   }
 }

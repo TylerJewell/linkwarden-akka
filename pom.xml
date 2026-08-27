@@ -11,4 +11,87 @@
     <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>linkwarden-akka</name>
+
+    <dependencies>
+        <!-- The bookmark files an import reads are hand-edited and browser-written HTML with
+             unclosed tags; a tolerant parser is what the original uses too. -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>1.18.3</version>
+        </dependency>
+        <!-- Passwords are stored as bcrypt at cost 10, so an account created by the original
+             signs in against the rebuild and the other way round. -->
+        <dependency>
+            <groupId>org.mindrot</groupId>
+            <artifactId>jbcrypt</artifactId>
+            <version>0.4</version>
+        </dependency>
+        <!-- Session and access tokens are the same encrypted JWT the original issues. -->
+        <dependency>
+            <groupId>com.nimbusds</groupId>
+            <artifactId>nimbus-jose-jwt</artifactId>
+            <version>9.40</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- The instance's secret is configuration, and every token route reads it. Tests get
+                 a fixed one so a signed token is reproducible across runs. -->
+            <!-- The file store is a directory, and a test that checks a file is absent is
+                 checking the store rather than the run before it. Emptied before every run. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-clean-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>empty-the-test-file-store</id>
+                        <phase>process-test-classes</phase>
+                        <goals>
+                            <goal>clean</goal>
+                        </goals>
+                        <configuration>
+                            <excludeDefaultDirectories>true</excludeDefaultDirectories>
+                            <filesets>
+                                <fileset>
+                                    <directory>target/test-data</directory>
+                                </fileset>
+                            </filesets>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- The instance's secret is configuration, and every token route reads it. Both
+                 phases get a fixed one so a signed token is reproducible across runs. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <environmentVariables>
+                        <NEXTAUTH_SECRET>test-secret-for-linkwarden-akka</NEXTAUTH_SECRET>
+                        <STORAGE_FOLDER>target/test-data</STORAGE_FOLDER>
+                    </environmentVariables>
+                    <!-- A test that starts a runtime belongs to the phase named for it, and is
+                         run once rather than in both. -->
+                    <excludes>
+                        <exclude>**/*IntegrationTest.java</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <environmentVariables>
+                        <NEXTAUTH_SECRET>test-secret-for-linkwarden-akka</NEXTAUTH_SECRET>
+                        <STORAGE_FOLDER>target/test-data</STORAGE_FOLDER>
+                    </environmentVariables>
+                    <!-- A fork per class. Each of these starts a runtime of its own, and a class
+                         that configures the instance differently must not reach the next one. -->
+                    <reuseForks>false</reuseForks>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

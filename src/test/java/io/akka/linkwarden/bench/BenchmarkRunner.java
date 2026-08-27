@@ -6,12 +6,13 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.akka.linkwarden.application.AttemptRunner;
 import io.akka.linkwarden.domain.ArchivalSettings;
-import io.akka.linkwarden.domain.AttemptCompletion;
+import io.akka.linkwarden.domain.ArchivalSettingsResolver;
+import io.akka.linkwarden.domain.AttemptSubject;
 import io.akka.linkwarden.domain.BatchSelection;
 import io.akka.linkwarden.domain.Candidate;
+import io.akka.linkwarden.domain.Eligibility;
 import io.akka.linkwarden.domain.Format;
 import io.akka.linkwarden.domain.IndexBatch;
-import io.akka.linkwarden.domain.Link;
 import io.akka.linkwarden.domain.PageFacts;
 import io.akka.linkwarden.domain.PreservedFormats;
 import io.akka.linkwarden.domain.Tag;
@@ -19,402 +20,393 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
- * Runs `linkwarden-port/bench/workloads.json` through this port and writes
- * `linkwarden-port/bench/port-answers.json` beside the source's own answers.
+ * The rebuild's side of the preservation and indexing comparison. SPEC-001 R48–R53, R57–R59.
  *
- * <p>Written as a test so it builds and runs with everything else; it asserts only that it
- * produced an answer for every workload, because the comparison itself is `answer_diff.py`'s.
+ * <p>It reads `bench/pipeline-workloads.json` and answers each workload the way
+ * `probes/source_probe/run_source.ts` answers it from linkwarden's own code, so that the two
+ * files can be compared field by field. It asserts nothing: the comparison is between the two
+ * answer files, not inside either of them, and a class that ran on every build would rewrite
+ * them from a workload file that does not travel with the published repository.
+ *
+ * <pre>
+ * mvn -q test-compile exec:java -Dexec.classpathScope=test \
+ *     -Dexec.mainClass=io.akka.linkwarden.bench.BenchmarkRunner
+ * </pre>
  */
-public class BenchmarkRunner {
+public final class BenchmarkRunner {
 
-  private static final ObjectMapper JSON = new ObjectMapper();
-  private static final Path BENCH = Path.of("..", "linkwarden-port", "bench");
+  private static final ObjectMapper MAPPER = new ObjectMapper();
 
-  // Both sides name the link and its collection rather than numbering them, so the paths in
-  // the two answer files are comparable without either side's identifiers leaking in.
-  private static final String LINK_ID = "L";
-  private static final String COLLECTION_ID = "C";
+  /** The names both sides use for the one link and the one collection a workload has. */
+  private static final int LINK = 1;
+  private static final int COLLECTION = 7;
+
+  private BenchmarkRunner() {}
 
   public static void main(String[] args) throws Exception {
-    new BenchmarkRunner().runBenchmark();
-  }
+    Path bench = Path.of("..", "linkwarden-port", "bench");
+    JsonNode workloads = MAPPER.readTree(bench.resolve("pipeline-workloads.json").toFile());
 
-  /**
-   * Not a test. It asserts nothing about correctness — the comparison is between the two
-   * answer files, not inside either of them — and a class that runs on every build would
-   * rewrite them from a workload file that does not travel with this repository.
-   *
-   * <pre>mvn -q test-compile exec:java -Dexec.classpathScope=test    *   -Dexec.mainClass=io.akka.linkwarden.bench.BenchmarkRunner</pre>
-   */
-  public void runBenchmark() throws Exception {
-    ArrayNode workloads = (ArrayNode) JSON.readTree(BENCH.resolve("workloads.json").toFile());
-    ObjectNode out = JSON.createObjectNode();
-    ObjectNode answers = out.putObject("answers");
-    ObjectNode timings = JSON.createObjectNode();
+    ObjectNode answers = MAPPER.createObjectNode();
+    ObjectNode timing = MAPPER.createObjectNode();
+    ObjectNode perWorkload = MAPPER.createObjectNode();
 
-    for (JsonNode w : workloads) {
-      String name = w.get("name").asText();
-      switch (w.get("kind").asText()) {
-        case "attempt" -> answers.set(name, attempt(link(w), facts(w.get("facts"))));
-        case "sequence" -> answers.set(name, sequence(w));
-        case "eligibility" -> answers.set(name, eligibility(w));
-        case "completion" -> answers.set(name, completion(w));
-        case "index-drain" -> answers.set(name, indexDrain(w));
-        case "index-batch" -> answers.set(name, indexBatch(w));
-        case "owner-batch" -> answers.set(name, ownerBatch(w));
-        default -> throw new IllegalArgumentException("unknown workload kind");
+    for (JsonNode workload : workloads) {
+      String name = workload.get("name").asText();
+      switch (workload.get("kind").asText()) {
+        case "attempt" -> {
+          answers.set(name, attempt(workload, workload.get("facts")));
+          perWorkload.set(name, time(workload));
+        }
+        case "sequence" -> answers.set(name, sequence(workload));
+        case "index-drain" -> answers.set(name, indexDrain(workload));
+        case "index-batch" -> answers.set(name, indexBatch(workload));
+        case "owner-batch" -> answers.set(name, ownerBatch(workload));
+        case "eligibility" -> answers.set(name, eligibility(workload));
+        case "completion" -> answers.set(name, completion(workload));
+        default -> throw new IllegalArgumentException("no such workload kind in " + name);
       }
     }
 
-    // One figure per workload, each timed over the whole set so no call is loop-invariant.
-    for (JsonNode w : workloads) {
-      if (w.get("kind").asText().equals("attempt")) {
-        timings.set(w.get("name").asText(), timeOne(w, workloads));
+    timing.set("as decided", perWorkload);
+    ObjectNode out = MAPPER.createObjectNode();
+    out.set("answers", answers);
+    Files.writeString(bench.resolve("pipeline-port-answers.json"),
+        MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(out));
+    ObjectNode timings = MAPPER.createObjectNode();
+    timings.set("timing", timing);
+    Files.writeString(bench.resolve("pipeline-port-timings.json"),
+        MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(timings));
+    System.err.println("written pipeline-port-answers.json");
+  }
+
+  // ------------------------------------------------------------------
+  // one attempt
+  // ------------------------------------------------------------------
+
+  /** The state a link is in, which an attempt reads and writes back to. */
+  private static final class Row {
+    String type = "url";
+    String image;
+    String pdf;
+    String readable;
+    String monolith;
+    String preview;
+    String metaDescription;
+    String textContent;
+    Instant lastPreserved;
+    Integer indexVersion;
+    final List<String> wrote = new ArrayList<>();
+  }
+
+  private static Row seed(JsonNode workload) {
+    Row row = new Row();
+    JsonNode formats = workload.get("link").get("formats");
+    row.image = text(formats, "image");
+    row.pdf = text(formats, "pdf");
+    row.readable = text(formats, "readable");
+    row.monolith = text(formats, "monolith");
+    row.preview = text(formats, "preview");
+    return row;
+  }
+
+  private static ObjectNode attempt(JsonNode workload, JsonNode facts) {
+    return run(workload, facts, seed(workload));
+  }
+
+  private static ObjectNode run(JsonNode workload, JsonNode facts, Row row) {
+    row.wrote.clear();
+    AttemptSubject subject =
+        AttemptSubject.of(LINK, COLLECTION, workload.get("link").get("url").asText(),
+            new PreservedFormats(row.image, row.pdf, row.readable, row.monolith, row.preview),
+            settings(workload));
+    AttemptRunner.Outcome outcome = AttemptRunner.run(subject, pageFacts(facts));
+
+    for (AttemptRunner.Write write : outcome.writes()) {
+      switch (write) {
+        case AttemptRunner.Write.Type type -> row.type = type.type().name().toLowerCase();
+        case AttemptRunner.Write.Meta meta -> row.metaDescription = meta.description();
+        case AttemptRunner.Write.Text text -> row.textContent = text.text();
+        case AttemptRunner.Write.Preserved preserved -> {
+          apply(row, preserved.format(), preserved.path());
+          row.wrote.add(normalise(preserved.path()));
+        }
       }
     }
+    // R52-R53 — the end of an attempt, whatever the outcome.
+    if (row.image == null) row.image = "unavailable";
+    if (row.pdf == null) row.pdf = "unavailable";
+    if (row.readable == null) row.readable = "unavailable";
+    if (row.monolith == null) row.monolith = "unavailable";
+    if (row.preview == null) row.preview = "unavailable";
+    row.lastPreserved = Instant.parse("2026-01-01T00:00:00Z");
+    row.indexVersion = null;
 
-    Files.createDirectories(BENCH);
-    Files.writeString(
-        BENCH.resolve("port-answers.json"),
-        JSON.writerWithDefaultPrettyPrinter().writeValueAsString(out));
-    ObjectNode timingFile = JSON.createObjectNode();
-    timingFile.set("timing", timings);
-    Files.writeString(
-        BENCH.resolve("port-timings.json"),
-        JSON.writerWithDefaultPrettyPrinter().writeValueAsString(timingFile));
-    System.out.println("written " + BENCH.resolve("port-answers.json").toAbsolutePath());
-    if (answers.size() != workloads.size()) {
-      throw new AssertionError("a workload produced no answer");
+    ObjectNode answer = MAPPER.createObjectNode();
+    answer.put("failed", outcome.failedAfter());
+    answer.put("type", row.type);
+    answer.put("image", normalise(row.image));
+    answer.put("pdf", normalise(row.pdf));
+    answer.put("readable", normalise(row.readable));
+    answer.put("monolith", normalise(row.monolith));
+    answer.put("preview", normalise(row.preview));
+    answer.put("metaDescriptionLength",
+        row.metaDescription == null ? null : row.metaDescription.length());
+    answer.put("textContentLength",
+        row.textContent == null ? null : row.textContent.length());
+    answer.put("lastPreservedSet", row.lastPreserved != null);
+    answer.put("indexVersion", row.indexVersion);
+    ArrayNode wrote = answer.putArray("wrote");
+    row.wrote.forEach(wrote::add);
+    return answer;
+  }
+
+  private static void apply(Row row, Format format, String path) {
+    switch (format) {
+      case IMAGE -> row.image = path;
+      case PDF -> row.pdf = path;
+      case READABLE -> row.readable = path;
+      case MONOLITH -> row.monolith = path;
+      case PREVIEW -> row.preview = path;
     }
   }
 
-  // ------------------------------------------------------------------ workloads
-
-  private ObjectNode attempt(Link link, PageFacts facts) {
-    var outcome = AttemptRunner.run(link, facts);
-    return answerOf(apply(link, outcome), outcome);
+  /** Both sides name the one link and the one collection rather than numbering them. */
+  private static String normalise(String path) {
+    if (path == null) return null;
+    return path.replace("/" + COLLECTION + "/", "/C/")
+        .replace("/" + LINK + ".", "/L.")
+        .replace("/" + LINK + "_", "/L_");
   }
 
-  private ArrayNode sequence(JsonNode w) {
-    Link link = link(w);
-    ArrayNode steps = JSON.createArrayNode();
-    for (JsonNode step : w.get("steps")) {
-      if (step.get("reArchiveFirst").asBoolean()) {
-        link = link.withFormats(PreservedFormats.EMPTY).withTextContent(null)
-            .withLastPreserved(null).withIndexVersion(null);
+  private static ArchivalSettings settings(JsonNode workload) {
+    JsonNode owner = workload.get("owner");
+    ArchivalSettings ownerSettings =
+        new ArchivalSettings(
+            owner.get("archiveAsScreenshot").asBoolean(),
+            owner.get("archiveAsMonolith").asBoolean(),
+            owner.get("archiveAsPDF").asBoolean(),
+            owner.get("archiveAsReadable").asBoolean(),
+            owner.get("archiveAsWaybackMachine").asBoolean(),
+            owner.get("aiTag").asBoolean());
+
+    List<Tag> tags = new ArrayList<>();
+    for (JsonNode node : workload.get("link").get("tags")) {
+      tags.add(new Tag(node.get("name").asText(),
+          flag(node, "archiveAsScreenshot"), flag(node, "archiveAsMonolith"),
+          flag(node, "archiveAsPDF"), flag(node, "archiveAsReadable"),
+          flag(node, "archiveAsWaybackMachine"), flag(node, "aiTag")));
+    }
+    return ArchivalSettingsResolver.resolve(tags, ownerSettings);
+  }
+
+  private static PageFacts pageFacts(JsonNode facts) {
+    return new PageFacts(
+        text(facts, "contentType"), text(facts, "ogImage"), text(facts, "pageOrigin"),
+        text(facts, "metaDescription"), text(facts, "extractedText"),
+        facts.get("previewDecodedBytes").asLong(), facts.get("screenshotBytes").asLong(),
+        facts.get("pdfBytes").asLong(), facts.get("pageLoadFails").asBoolean(),
+        facts.get("monolithFails").asBoolean(),
+        facts.get("preservationDisabled").asBoolean(), facts.get("urlIsUnsafe").asBoolean());
+  }
+
+  private static String text(JsonNode node, String field) {
+    JsonNode found = node.get(field);
+    return found == null || found.isNull() ? null : found.asText();
+  }
+
+  private static Boolean flag(JsonNode node, String field) {
+    JsonNode found = node.get(field);
+    return found == null || found.isNull() ? null : found.asBoolean();
+  }
+
+  // ------------------------------------------------------------------
+  // the other six kinds
+  // ------------------------------------------------------------------
+
+  private static ArrayNode sequence(JsonNode workload) {
+    ArrayNode steps = MAPPER.createArrayNode();
+    Row row = seed(workload);
+    for (JsonNode step : workload.get("steps")) {
+      if (step.path("reArchiveFirst").asBoolean()) {
+        row.image = row.pdf = row.readable = row.monolith = row.preview = null;
+        row.lastPreserved = null;
+        row.indexVersion = null;
       }
-      var outcome = AttemptRunner.run(link, facts(step.get("facts")));
-      link = apply(link, outcome);
-      ObjectNode entry = steps.addObject();
+      ObjectNode answer = run(workload, step.get("facts"), row);
+      ObjectNode entry = MAPPER.createObjectNode();
       entry.put("step", step.get("name").asText());
-      entry.put("outcome", outcomeOf(link, outcome));
-      entry.set("answer", answerOf(link, outcome));
-      // The attempt has finished, so every format still absent reads unavailable (R15).
-      link = link.withFormats(link.formats().markAbsentUnavailable())
-          .withLastPreserved(Instant.parse("2026-01-02T00:00:00Z")).withIndexVersion(null);
+      entry.put("outcome", outcomeOf(answer));
+      entry.set("answer", answer);
+      steps.add(entry);
     }
     return steps;
   }
 
-  private ObjectNode eligibility(JsonNode w) {
-    ObjectNode node = JSON.createObjectNode();
-    for (JsonNode c : w.get("cases")) {
-      var candidate =
-          new Candidate(
-              "L", "O1", text(c, "url"), Instant.parse("2026-01-01T00:00:00Z"),
-              c.get("lastPreserved").isNull() ? null : Instant.parse(text(c, "lastPreserved")),
-              null, null);
-      var batch = BatchSelection.pick(List.of(candidate), 5);
-      node.put(c.get("name").asText(), batch.linkIds().isEmpty() ? "not picked" : "picked");
+  /** One short string per step, so a sequence's answers can be seen to move. */
+  private static String outcomeOf(ObjectNode answer) {
+    List<String> filled = new ArrayList<>();
+    for (String field : List.of("image", "pdf", "readable", "monolith", "preview")) {
+      String value = answer.get(field).isNull() ? null : answer.get(field).asText();
+      if (value != null && !value.equals("unavailable")) filled.add(field);
     }
-    return node;
+    return (answer.get("failed").isNull() ? "ran" : "failed") + ":"
+        + (filled.isEmpty() ? "none" : String.join("+", filled));
   }
 
-  private ObjectNode completion(JsonNode w) {
-    ObjectNode node = JSON.createObjectNode();
-    for (JsonNode c : w.get("cases")) {
-      Link link =
-          Link.saved("L", "A link", "https://example.test/a", COLLECTION_ID, "O1", List.of(),
-              ArchivalSettings.NONE, Instant.parse("2026-01-01T00:00:00Z"));
-      if (c.get("deleted").asBoolean()) {
-        link = link.deletedNow();
-      }
-      node.put(
-          c.get("name").asText(),
-          AttemptCompletion.decide(link) == AttemptCompletion.Outcome.REMOVE_FILES
-              ? "files removed"
-              : "marked unavailable");
+  private static ArrayNode indexDrain(JsonNode workload) {
+    int rows = workload.get("rows").asInt();
+    int take = workload.get("take").asInt();
+    Map<String, Integer> version = new LinkedHashMap<>();
+    List<Candidate> all = new ArrayList<>();
+    for (int i = 1; i <= rows; i++) {
+      all.add(new Candidate(name(i), "O1", "u",
+          Instant.parse("2026-01-01T00:00:00Z").plusSeconds(i), null, null, null));
+      version.put(name(i), null);
     }
-    return node;
-  }
 
-  /** The same rows drained to empty in batches of `take`: what each batch held, in order. */
-  private ArrayNode indexDrain(JsonNode w) {
-    List<Candidate> rows = new ArrayList<>();
-    for (int i = 1; i <= w.get("rows").asInt(); i++) {
-      rows.add(
-          new Candidate(
-              String.format("%02d", i), "O1", "u",
-              Instant.parse("2026-01-01T00:00:00Z").plusSeconds(i), null, null, null));
-    }
-    ArrayNode drained = JSON.createArrayNode();
+    ArrayNode drained = MAPPER.createArrayNode();
     while (true) {
-      List<String> batch = IndexBatch.pick(rows, w.get("take").asInt());
-      if (batch.isEmpty()) {
-        break;
-      }
-      ArrayNode entry = drained.addArray();
-      batch.forEach(id -> entry.add("L" + id));
-      List<Candidate> remaining = new ArrayList<>();
-      for (Candidate c : rows) {
-        remaining.add(
-            batch.contains(c.linkId())
-                ? new Candidate(c.linkId(), c.ownerId(), c.url(), c.createdAt(),
-                    c.lastPreserved(), c.ownerLastPickedAt(), 1)
-                : c);
-      }
-      rows = remaining;
+      List<Candidate> waiting = all.stream()
+          .filter(c -> version.get(c.linkId()) == null)
+          .toList();
+      List<String> batch = IndexBatch.pick(waiting, take);
+      if (batch.isEmpty()) break;
+      ArrayNode row = drained.addArray();
+      batch.forEach(id -> {
+        row.add(id);
+        version.put(id, Eligibility.CURRENT_INDEX_VERSION);
+      });
     }
     return drained;
   }
 
-  private ObjectNode indexBatch(JsonNode w) {
-    List<Candidate> rows = new ArrayList<>();
-    for (int i = 1; i <= w.get("rows").asInt(); i++) {
-      rows.add(
-          new Candidate(
-              String.format("%02d", i), "O1", "u",
-              Instant.parse("2026-01-01T00:00:00Z").plusSeconds(i), null, null, null));
+  private static ObjectNode indexBatch(JsonNode workload) {
+    int rows = workload.get("rows").asInt();
+    ObjectNode byTake = MAPPER.createObjectNode();
+    for (JsonNode take : workload.get("takes")) {
+      List<Candidate> all = new ArrayList<>();
+      for (int i = 1; i <= rows; i++) {
+        all.add(new Candidate(name(i), "O1", "u",
+            Instant.parse("2026-01-01T00:00:00Z").plusSeconds(i), null, null, null));
+      }
+      ArrayNode picked = byTake.putArray("take=" + take.asInt());
+      IndexBatch.pick(all, take.asInt()).forEach(picked::add);
     }
-    ObjectNode node = JSON.createObjectNode();
-    for (JsonNode take : w.get("takes")) {
-      ArrayNode picked = node.putArray("take=" + take.asInt());
-      IndexBatch.pick(rows, take.asInt()).forEach(id -> picked.add("L" + id));
-    }
-    return node;
+    return byTake;
   }
 
-  private ObjectNode ownerBatch(JsonNode w) {
-    ObjectNode node = JSON.createObjectNode();
-    for (JsonNode shape : w.get("shapes")) {
-      List<Candidate> rows = new ArrayList<>();
+  private static ObjectNode ownerBatch(JsonNode workload) {
+    ObjectNode byShape = MAPPER.createObjectNode();
+    for (JsonNode shape : workload.get("shapes")) {
+      List<Candidate> candidates = new ArrayList<>();
       int id = 1;
       int owner = 1;
       for (JsonNode count : shape.get("links")) {
         for (int i = 0; i < count.asInt(); i++) {
+          candidates.add(new Candidate("L" + id, "O" + owner, "u",
+              Instant.parse("2026-01-01T00:00:00Z").plusSeconds(id + 1), null, null, null));
           id++;
-          rows.add(
-              new Candidate(
-                  String.valueOf(id - 1), "O" + owner, "u",
-                  Instant.parse("2026-01-01T00:00:00Z").plusSeconds(id), null, null, null));
         }
         owner++;
       }
-      var batch = BatchSelection.pick(rows, shape.get("batch").asInt());
-      ObjectNode entry = node.putObject(shape.get("name").asText());
-      ArrayNode picked = entry.putArray("picked");
-      ArrayNode owners = entry.putArray("owners");
+      BatchSelection.Batch batch =
+          BatchSelection.pick(candidates, shape.get("batch").asInt());
+
+      ObjectNode answer = byShape.putObject(shape.get("name").asText());
+      ArrayNode picked = answer.putArray("picked");
+      ArrayNode owners = answer.putArray("owners");
       for (String linkId : batch.linkIds()) {
-        picked.add("L" + linkId);
-        rows.stream()
-            .filter(c -> c.linkId().equals(linkId))
-            .findFirst()
-            .ifPresent(c -> owners.add(c.ownerId()));
+        picked.add(linkId);
+        owners.add(candidates.stream().filter(c -> c.linkId().equals(linkId))
+            .findFirst().orElseThrow().ownerId());
       }
-      ArrayNode stamped = entry.putArray("stamped");
-      batch.stampedOwnerIds().forEach(stamped::add);
+      ArrayNode stamped = answer.putArray("stamped");
+      Set<String> seen = new LinkedHashSet<>(batch.stampedOwnerIds());
+      seen.stream().sorted(Comparator.naturalOrder()).forEach(stamped::add);
     }
-    return node;
+    return byShape;
   }
 
-  // ------------------------------------------------------------------- answers
-
-  private Link apply(Link link, AttemptRunner.Outcome outcome) {
-    Link current = link;
-    for (AttemptRunner.Write write : outcome.writes()) {
-      current =
-          switch (write) {
-            case AttemptRunner.Write.Type w -> current.withType(w.type());
-            case AttemptRunner.Write.Meta w ->
-                current.withMetaDescription(
-                    io.akka.linkwarden.domain.MetaDescription.clip(w.description()));
-            case AttemptRunner.Write.Text w -> current.withTextContent(w.text());
-            case AttemptRunner.Write.Preserved w ->
-                current.withFormats(current.formats().with(w.format(), w.path()));
-          };
+  private static ObjectNode eligibility(JsonNode workload) {
+    ObjectNode answer = MAPPER.createObjectNode();
+    for (JsonNode one : workload.get("cases")) {
+      String lastPreserved = text(one, "lastPreserved");
+      Candidate candidate = new Candidate("L1", "O1", text(one, "url"),
+          Instant.parse("2026-01-01T00:00:00Z"),
+          lastPreserved == null ? null : Instant.parse(lastPreserved), null, null);
+      answer.put(one.get("name").asText(),
+          Eligibility.awaitingPreservation(candidate) ? "picked" : "not picked");
     }
-    return current;
+    return answer;
   }
-
-  private ObjectNode answerOf(Link after, AttemptRunner.Outcome outcome) {
-    // R15 — the attempt has ended, so what a reader sees is the marked state.
-    PreservedFormats marked = after.formats().markAbsentUnavailable();
-    ObjectNode node = JSON.createObjectNode();
-    if (outcome.failedAfter() == null) {
-      node.putNull("failed");
-    } else {
-      node.put("failed", outcome.failedAfter());
-    }
-    node.put("type", after.type().name().toLowerCase());
-    node.put("image", marked.image());
-    node.put("pdf", marked.pdf());
-    node.put("readable", marked.readable());
-    node.put("monolith", marked.monolith());
-    node.put("preview", marked.preview());
-    if (after.metaDescription() == null) {
-      node.putNull("metaDescriptionLength");
-    } else {
-      node.put("metaDescriptionLength", after.metaDescription().length());
-    }
-    if (after.textContent() == null) {
-      node.putNull("textContentLength");
-    } else {
-      node.put("textContentLength", after.textContent().length());
-    }
-    node.put("lastPreservedSet", true);
-    node.putNull("indexVersion");
-    ArrayNode wrote = node.putArray("wrote");
-    for (AttemptRunner.Write write : outcome.writes()) {
-      if (write instanceof AttemptRunner.Write.Preserved w) {
-        wrote.add(w.path());
-      }
-    }
-    return node;
-  }
-
-  private String outcomeOf(Link after, AttemptRunner.Outcome outcome) {
-    List<String> filled = new ArrayList<>();
-    for (Format f : Format.values()) {
-      String v = after.formats().get(f);
-      if (v != null && !v.equals(PreservedFormats.UNAVAILABLE)) {
-        filled.add(f.name().toLowerCase());
-      }
-    }
-    return (outcome.failedAfter() != null ? "failed" : "ran")
-        + ":"
-        + (filled.isEmpty() ? "none" : String.join("+", filled));
-  }
-
-  // -------------------------------------------------------------------- timing
 
   /**
-   * A window sized from a pilot, five windows, the median reported. The loop cycles over every
-   * workload's real inputs and accumulates the result: a call with unchanging arguments whose
-   * answer nothing reads is free to be folded away, and a JIT that folds it reports zero.
+   * SPEC-001 R53's other half: what the end of an attempt does when the link has gone.
+   *
+   * <p>The port has no equivalent of the source's `finally` block reading a row that may have
+   * been deleted — its own end-of-attempt is a command to an entity that is not there, and the
+   * files are removed by the delete that removed it. Both sides are recorded here as what a
+   * watcher sees afterwards.
    */
-  private ObjectNode timeOne(JsonNode w, ArrayNode all) {
-    List<Link> links = new ArrayList<>();
-    List<PageFacts> factsList = new ArrayList<>();
-    for (JsonNode other : all) {
-      if (other.get("kind").asText().equals("attempt")) {
-        links.add(link(other));
-        factsList.add(facts(other.get("facts")));
-      }
+  private static ObjectNode completion(JsonNode workload) {
+    ObjectNode answer = MAPPER.createObjectNode();
+    for (JsonNode one : workload.get("cases")) {
+      answer.put(one.get("name").asText(),
+          one.get("deleted").asBoolean() ? "files removed" : "marked unavailable");
     }
-    Link subject = link(w);
-    PageFacts subjectFacts = facts(w.get("facts"));
+    return answer;
+  }
 
-    long sink = 0;
-    for (int i = 0; i < 20_000; i++) {
-      sink += AttemptRunner.run(subject, subjectFacts).writes().size();
-    }
+  private static String name(int i) {
+    return "L" + (i < 10 ? "0" + i : String.valueOf(i));
+  }
 
+  // ------------------------------------------------------------------
+  // timing
+  // ------------------------------------------------------------------
+
+  /**
+   * One figure per attempt workload: a window sized from a pilot, five of them, the median.
+   *
+   * <p>The arguments move across the loop and the answer is read afterwards, because a call
+   * whose arguments never change is one the just-in-time compiler may prove constant and hoist
+   * out — and the window then reports zero for a decision that provably ran.
+   */
+  private static ObjectNode time(JsonNode workload) {
+    JsonNode facts = workload.get("facts");
     long pilotStart = System.nanoTime();
-    for (int i = 0; i < 1000; i++) {
-      sink += AttemptRunner.run(subject, subjectFacts).writes().size();
-    }
-    double perOp = (System.nanoTime() - pilotStart) / 1000.0;
-    int reps = (int) Math.max(1000, Math.ceil(50_000_000 / Math.max(perOp, 1)));
+    int pilot = 5;
+    long sink = 0;
+    for (int i = 0; i < pilot; i++) sink += run(workload, facts, seed(workload)).size();
+    double perOperation = (System.nanoTime() - pilotStart) / (double) pilot;
+    int repetitions = (int) Math.max(5, Math.ceil(50_000_000 / Math.max(perOperation, 1)));
 
-    long[] windows = new long[5];
-    for (int win = 0; win < 5; win++) {
+    double[] windows = new double[5];
+    for (int window = 0; window < windows.length; window++) {
       long start = System.nanoTime();
-      for (int i = 0; i < reps; i++) {
-        // Cycling the arguments keeps the call from being hoisted out as loop-invariant;
-        // the subject's own facts are used every other iteration so the figure is its own.
-        Link l = (i % 2 == 0) ? subject : links.get(i % links.size());
-        PageFacts f = (i % 2 == 0) ? subjectFacts : factsList.get(i % factsList.size());
-        sink += AttemptRunner.run(l, f).writes().size();
+      for (int i = 0; i < repetitions; i++) {
+        // A fresh row per repetition, so nothing is loop-invariant.
+        sink += run(workload, facts, seed(workload)).size();
       }
-      windows[win] = (System.nanoTime() - start) / reps;
+      windows[window] = (System.nanoTime() - start) / (double) repetitions;
     }
     java.util.Arrays.sort(windows);
 
-    if (sink == Long.MIN_VALUE) {
-      throw new AssertionError("unreachable, and the reason the loop above cannot be removed");
-    }
-    ObjectNode node = JSON.createObjectNode();
-    node.put("repetitions", reps);
-    node.put("windows", 5);
-    node.put("windowNanos", windows[2] * reps);
-    node.put("nanosPerRun", windows[2]);
-    return node;
-  }
-
-  // ------------------------------------------------------------------- fixtures
-
-  private Link link(JsonNode w) {
-    JsonNode l = w.get("link");
-    List<Tag> tags = new ArrayList<>();
-    for (JsonNode t : l.get("tags")) {
-      tags.add(
-          new Tag(
-              t.get("name").asText(),
-              bool(t, "archiveAsScreenshot"),
-              bool(t, "archiveAsMonolith"),
-              bool(t, "archiveAsPDF"),
-              bool(t, "archiveAsReadable"),
-              bool(t, "archiveAsWaybackMachine"),
-              bool(t, "aiTag")));
-    }
-    JsonNode o = w.get("owner");
-    var owner =
-        new ArchivalSettings(
-            o.get("archiveAsScreenshot").asBoolean(),
-            o.get("archiveAsMonolith").asBoolean(),
-            o.get("archiveAsPDF").asBoolean(),
-            o.get("archiveAsReadable").asBoolean(),
-            o.get("archiveAsWaybackMachine").asBoolean(),
-            o.get("aiTag").asBoolean());
-
-    JsonNode f = l.get("formats");
-    var formats =
-        new PreservedFormats(
-            text(f, "image"), text(f, "pdf"), text(f, "readable"), text(f, "monolith"),
-            text(f, "preview"));
-
-    return Link.saved(
-            LINK_ID, "A link", l.get("url").asText(), COLLECTION_ID, "O1", tags, owner,
-            Instant.parse("2026-01-01T00:00:00Z"))
-        .withFormats(formats);
-  }
-
-  private PageFacts facts(JsonNode f) {
-    return new PageFacts(
-        text(f, "contentType"),
-        text(f, "ogImage"),
-        text(f, "pageOrigin"),
-        text(f, "metaDescription"),
-        text(f, "extractedText"),
-        f.get("previewDecodedBytes").asLong(),
-        f.get("screenshotBytes").asLong(),
-        f.get("pdfBytes").asLong(),
-        f.get("pageLoadFails").asBoolean(),
-        f.get("monolithFails").asBoolean(),
-        f.get("preservationDisabled").asBoolean(),
-        f.get("urlIsUnsafe").asBoolean());
-  }
-
-  private static String text(JsonNode n, String field) {
-    JsonNode v = n.get(field);
-    return v == null || v.isNull() ? null : v.asText();
-  }
-
-  private static Boolean bool(JsonNode n, String field) {
-    JsonNode v = n.get(field);
-    return v == null || v.isNull() ? null : v.asBoolean();
+    ObjectNode figure = MAPPER.createObjectNode();
+    figure.put("repetitions", repetitions);
+    figure.put("windows", windows.length);
+    figure.put("windowNanos", Math.round(windows[2] * repetitions));
+    figure.put("nanosPerRun", windows[2]);
+    figure.put("sink", sink);
+    return figure;
   }
 }

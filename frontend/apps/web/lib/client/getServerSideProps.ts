@@ -2,7 +2,10 @@ import { GetServerSideProps } from "next";
 import { serverSideTranslations } from "next-i18next/serverSideTranslations";
 import { i18n } from "next-i18next.config";
 import { getToken } from "next-auth/jwt";
-import { prisma } from "@linkwarden/prisma";
+
+// Where the account lives. Which language a page renders in is read from the account, and the
+// account is the rebuild's to answer for.
+const LINKWARDEN_API = process.env.LINKWARDEN_API || "http://localhost:9160";
 
 const getServerSideProps: GetServerSideProps = async (ctx) => {
   const acceptLanguageHeader = ctx.req.headers["accept-language"];
@@ -10,13 +13,14 @@ const getServerSideProps: GetServerSideProps = async (ctx) => {
 
   const token = await getToken({ req: ctx.req });
 
-  if (token) {
-    const user = await prisma.user.findUnique({
-      where: {
-        id: token.id,
-      },
-    });
+  if (token && (token as any).apiToken) {
+    const answer = await fetch(`${LINKWARDEN_API}/api/v1/users/me`, {
+      headers: { Authorization: `Bearer ${(token as any).apiToken}` },
+    })
+      .then((it) => (it.ok ? it.json() : null))
+      .catch(() => null);
 
+    const user = answer?.response;
     if (user) {
       return {
         props: {

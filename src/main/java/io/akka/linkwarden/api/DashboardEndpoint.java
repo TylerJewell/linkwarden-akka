@@ -1,170 +1,193 @@
 package io.akka.linkwarden.api;
 
-import akka.NotUsed;
+import akka.http.javadsl.model.HttpResponse;
 import akka.javasdk.annotations.Acl;
 import akka.javasdk.annotations.http.Get;
 import akka.javasdk.annotations.http.HttpEndpoint;
-import akka.javasdk.client.ComponentClient;
-import akka.javasdk.http.AbstractHttpEndpoint;
-import akka.javasdk.http.HttpResponses;
-import akka.http.javadsl.model.HttpResponse;
-import akka.stream.javadsl.Source;
+import akka.javasdk.annotations.http.Put;
+import com.fasterxml.jackson.databind.JsonNode;
+import io.akka.linkwarden.application.Data;
 import io.akka.linkwarden.application.LinksView;
-import java.time.Duration;
+import io.akka.linkwarden.application.UserEntity;
+import io.akka.linkwarden.domain.Config;
+import io.akka.linkwarden.domain.Ids;
+import io.akka.linkwarden.domain.Permissions;
+import io.akka.linkwarden.domain.Records;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 /**
- * What linkwarden's own dashboard reads, served as a stream.
+ * The two dashboards. SPEC-001 R71–R72.
  *
- * <p>RENDERING.md R1: the front end this port ships is linkwarden's own, and the one thing
- * changed in it is where this screen's data comes from — a subscription here instead of the
- * repeated fetch its `useDashboardData` hook used to make. R4's test is that deleting the
- * subscription leaves the list with no other route to its data, which holds: the hook no
- * longer knows the address of a request that returns links.
- *
- * <p>The payload is linkwarden's own shape, because the interface reading it was not
- * changed. Everything on it that this port's slice does not own — the collection a link
- * sits in, the counts beside the heading — is carried as it was given, so that a difference
- * on the screen is a difference in the archiving pipeline and not in something neither
- * system was being asked about.
+ * <p>They are two different answers rather than two versions of one: the first is a flat list of
+ * links, the second is that list plus one per collection section, a count of pinned links and a
+ * count of tags, under the other envelope.
  */
 @Acl(allow = @Acl.Matcher(principal = Acl.Principal.ALL))
-@HttpEndpoint("/dashboard")
-public class DashboardEndpoint extends AbstractHttpEndpoint {
+@HttpEndpoint("/api")
+public class DashboardEndpoint extends Surface {
 
-  /** One link, in the shape linkwarden's link card reads. */
-  public record DashboardLink(
-      long id,
-      String name,
-      String type,
-      String description,
-      long createdById,
-      long collectionId,
-      String icon,
-      String iconWeight,
-      String color,
-      String url,
-      String preview,
-      String image,
-      String pdf,
-      String readable,
-      String monolith,
-      boolean clientSide,
-      boolean aiTagged,
-      String metaDescription,
-      Integer indexVersion,
-      String lastPreserved,
-      String importDate,
-      String createdAt,
-      String updatedAt,
-      List<Object> tags,
-      Collection collection,
-      List<Object> pinnedBy) {}
+  private static final int V1_TAKE = 10;
+  private static final int V2_TAKE = 16;
 
-  public record Collection(
-      long id,
-      String name,
-      String description,
-      String icon,
-      String iconWeight,
-      String color,
-      Long parentId,
-      boolean isPublic,
-      long ownerId,
-      long createdById,
-      String createdAt,
-      String updatedAt) {}
-
-  public record Dashboard(
-      List<DashboardLink> links,
-      List<Object> pinnedLinks,
-      long numberOfLinks,
-      long numberOfCollections,
-      long numberOfTags,
-      long numberOfPinnedLinks,
-      List<Object> dashboardSections) {}
-
-  public record Envelope(Dashboard data) {}
-
-  private static final Duration TICK = Duration.ofSeconds(1);
-
-  private final ComponentClient client;
-
-  public DashboardEndpoint(ComponentClient client) {
-    this.client = client;
+  public DashboardEndpoint(Data data, Config config) {
+    super(data, config);
   }
 
-  @Get("/stream")
-  public HttpResponse stream() {
-    // A first element straight away so the screen is never empty while it waits, then one
-    // whenever the read side has moved. The client holds the connection open, so nothing
-    // here is a request the page makes again.
-    Source<Envelope, NotUsed> updates =
-        Source.tick(Duration.ZERO, TICK, "tick")
-            .map(ignored -> current())
-            .statefulMapConcat(
-                () -> {
-                  final Envelope[] last = new Envelope[1];
-                  return envelope -> {
-                    if (last[0] != null && last[0].equals(envelope)) {
-                      return List.of();
-                    }
-                    last[0] = envelope;
-                    return List.of(envelope);
-                  };
-                })
-            .mapMaterializedValue(m -> NotUsed.getInstance());
-    return HttpResponses.serverSentEvents(updates);
+  /** SPEC-001 R71 — ten pinned and ten recent, merged, de-duplicated, newest identifier first. */
+  @Get("/v1/dashboard")
+  public HttpResponse v1() {
+    Caller.Result result = signedIn();
+    if (result.refused()) return result.refusal();
+    int userId = result.user().id();
+
+    List<LinksView.LinkRow> reachable = data.reachableLinkRows(userId);
+    List<LinksView.LinkRow> pinned = take(reachable.stream().filter(row -> row.pinnedBy().contains(userId)).toList(), V1_TAKE);
+    List<LinksView.LinkRow> recent = take(reachable, V1_TAKE);
+    return Answers.wrapped(200, merged(recent, pinned, userId, false));
   }
 
-  @Get
-  public Envelope snapshot() {
-    return current();
+  @Get("/v2/dashboard")
+  public HttpResponse v2() {
+    Caller.Result result = signedIn();
+    if (result.refused()) return result.refusal();
+    return Answers.enveloped(200, v2Body(result.user()), true, "Dashboard data fetched successfully.");
   }
 
-  private Envelope current() {
-    var rows = client.forView().method(LinksView::all).invoke().links();
-    List<DashboardLink> links = new ArrayList<>();
-    for (LinksView.LinkEntry r : rows) {
-      links.add(
-          new DashboardLink(
-              Long.parseLong(r.linkId()),
-              r.title(),
-              r.type().name().toLowerCase(),
-              "",
-              1,
-              Long.parseLong(r.collectionId()),
-              null,
-              null,
-              null,
-              r.url().orElse(null),
-              r.preview().orElse(null),
-              r.image().orElse(null),
-              r.pdf().orElse(null),
-              r.readable().orElse(null),
-              r.monolith().orElse(null),
-              false,
-              false,
-              r.metaDescription().orElse(null),
-              r.indexVersion() == 0 ? null : r.indexVersion(),
-              r.lastPreserved().map(Instant::toString).orElse(null),
-              null,
-              r.createdAt().toString(),
-              r.lastPreserved().orElse(r.createdAt()).toString(),
-              List.of(),
-              unorganised(),
-              List.of()));
+  /** SPEC-001 R71 — the whole second dashboard, which the layout route also answers with. */
+  public Map<String, Object> v2Body(Records.User user) {
+    int userId = user.id();
+    List<LinksView.LinkRow> reachable = data.reachableLinkRows(userId);
+    List<LinksView.LinkRow> pinnedRows =
+        reachable.stream().filter(row -> row.pinnedBy().contains(userId)).toList();
+
+    List<Records.DashboardSection> sections =
+        user.dashboardSections() == null ? List.of() : user.dashboardSections();
+    boolean viewPinned = sections.stream().anyMatch(s -> "PINNED_LINKS".equals(s.type()));
+    boolean viewRecent = sections.stream().anyMatch(s -> "RECENT_LINKS".equals(s.type()));
+    List<Records.DashboardSection> collectionSections =
+        sections.stream().filter(s -> "COLLECTION".equals(s.type())).toList();
+
+    Map<String, Object> body = new LinkedHashMap<>();
+    long numberOfTags = visibleTagCount(userId);
+    // R71 — with no link section of any kind enabled the answer stops here, and carries neither
+    // a links list worth reading nor the per-collection map.
+    if (!viewPinned && !viewRecent && collectionSections.isEmpty()) {
+      body.put("links", List.of());
+      body.put("numberOfPinnedLinks", pinnedRows.size());
+      body.put("numberOfTags", numberOfTags);
+      return body;
     }
-    links.sort((a, b) -> Long.compare(b.id(), a.id()));
-    return new Envelope(
-        new Dashboard(links, List.of(), links.size(), 1, 0, 0, List.of()));
+
+    List<LinksView.LinkRow> pinned = viewPinned ? take(pinnedRows, V2_TAKE) : List.of();
+    List<LinksView.LinkRow> recent = viewRecent ? take(reachable, V2_TAKE) : List.of();
+
+    Map<String, Object> collectionLinks = new LinkedHashMap<>();
+    for (Records.DashboardSection section : collectionSections) {
+      if (section.collectionId() == null) continue;
+      Optional<Records.Collection> collection = data.collection(section.collectionId());
+      if (collection.isEmpty() || !Permissions.canRead(collection.get().asSubject(), userId)) continue;
+      List<LinksView.LinkRow> inside =
+          take(reachable.stream().filter(row -> row.collectionId() == section.collectionId()).toList(), V2_TAKE);
+      collectionLinks.put(
+          String.valueOf(section.collectionId()), inside.stream().map(row -> shape(row, userId, true)).toList());
+    }
+
+    body.put("links", merged(recent, pinned, userId, true));
+    body.put("collectionLinks", collectionLinks);
+    body.put("numberOfPinnedLinks", pinnedRows.size());
+    body.put("numberOfTags", numberOfTags);
+    return body;
   }
 
-  private Collection unorganised() {
-    return new Collection(
-        1, "Unorganized", "", null, null, "#0ea5e9", null, false, 1, 1,
-        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+  /** SPEC-001 R72 — a section naming a collection the caller cannot reach is dropped, not refused. */
+  @Put("/v2/dashboard")
+  public HttpResponse updateLayout(JsonNode body) {
+    Caller.Result result = signedIn();
+    if (result.refused()) return result.refusal();
+    if (config.demoMode()) return Answers.demoRefusal();
+
+    int userId = result.user().id();
+    List<Records.DashboardSection> sections = new ArrayList<>();
+    int nextId = 1;
+    List<JsonNode> given = new ArrayList<>();
+    if (body != null && body.isArray()) body.forEach(given::add);
+    for (JsonNode node : given) {
+      Integer collectionId = Bodies.number(node, "collectionId");
+      if (collectionId != null) {
+        Optional<Records.Collection> collection = data.collection(collectionId);
+        if (collection.isEmpty() || !Permissions.canRead(collection.get().asSubject(), userId)) {
+          continue;
+        }
+      }
+      if (!Bodies.isOn(node, "enabled")) continue;
+      Integer order = Bodies.number(node, "order");
+      sections.add(
+          new Records.DashboardSection(
+              nextId++, userId, collectionId, Bodies.text(node, "type"), order == null ? 0 : order));
+    }
+
+    Records.User updated =
+        data.client()
+            .forKeyValueEntity(Ids.user(userId))
+            .method(UserEntity::setDashboardSections)
+            .invoke(new UserEntity.SetDashboardSections(sections, Instant.now()));
+    // The layout route answers with the whole of what the second dashboard would answer,
+    // its own status among it, rather than with the envelope a read wears.
+    Map<String, Object> answer = new LinkedHashMap<>();
+    answer.put("data", v2Body(updated));
+    answer.put("message", "Dashboard data fetched successfully.");
+    answer.put("statusCode", 200);
+    answer.put("success", true);
+    return Answers.json(200, answer);
+  }
+
+  // ------------------------------------------------------------------
+
+  private static List<LinksView.LinkRow> take(List<LinksView.LinkRow> rows, int count) {
+    return rows.size() <= count ? rows : rows.subList(0, count);
+  }
+
+  /** Recent then pinned, first occurrence kept, then newest identifier first. */
+  private List<Map<String, Object>> merged(
+      List<LinksView.LinkRow> recent, List<LinksView.LinkRow> pinned, int userId,
+      boolean omitText) {
+    Map<Integer, LinksView.LinkRow> byId = new LinkedHashMap<>();
+    for (LinksView.LinkRow row : recent) byId.putIfAbsent(row.id(), row);
+    for (LinksView.LinkRow row : pinned) byId.putIfAbsent(row.id(), row);
+    List<LinksView.LinkRow> all = new ArrayList<>(byId.values());
+    all.sort(java.util.Comparator.comparingInt(LinksView.LinkRow::id).reversed());
+    return all.stream().map(row -> shape(row, userId, omitText)).toList();
+  }
+
+  /** A dashboard link carries only the caller's own pin, never anybody else's. */
+  private Map<String, Object> shape(LinksView.LinkRow row, int userId, boolean omitText) {
+    Records.Link link = data.link(row.id()).orElse(null);
+    if (link == null) return new LinkedHashMap<>();
+    List<Integer> ownPin = link.pinnedBy().contains(userId) ? List.of(userId) : List.of();
+    // The second dashboard leaves the page's own text out; the first does not, and both
+    // draw their rows through here, so which one is asking decides.
+    return Shapes.link(
+        link,
+        data.collection(link.collectionId()).orElse(null),
+        data.tagsOf(link),
+        ownPin,
+        omitText);
+  }
+
+  private long visibleTagCount(int userId) {
+    Set<Integer> ids = new LinkedHashSet<>();
+    for (Records.Tag tag : data.tagsOwnedBy(userId)) ids.add(tag.id());
+    for (Records.Collection collection : data.reachableCollections(userId)) {
+      if (collection.ownerId() == userId) continue;
+      for (LinksView.LinkRow row : data.linkRowsIn(collection.id())) ids.addAll(row.tagIds());
+    }
+    return ids.size();
   }
 }

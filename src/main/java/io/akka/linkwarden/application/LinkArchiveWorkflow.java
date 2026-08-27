@@ -1,178 +1,175 @@
 package io.akka.linkwarden.application;
 
+import static java.time.Duration.ofSeconds;
+
 import akka.Done;
 import akka.javasdk.annotations.Component;
+import akka.javasdk.annotations.StepName;
 import akka.javasdk.client.ComponentClient;
 import akka.javasdk.workflow.Workflow;
-import com.typesafe.config.Config;
+import io.akka.linkwarden.domain.ArchivalSettings;
+import io.akka.linkwarden.domain.ArchivalSettingsResolver;
+import io.akka.linkwarden.domain.AttemptSubject;
+import io.akka.linkwarden.domain.Ids;
+import io.akka.linkwarden.domain.LinkType;
 import io.akka.linkwarden.domain.PageFacts;
+import io.akka.linkwarden.domain.PreservedFormats;
+import io.akka.linkwarden.domain.Records;
 import io.akka.linkwarden.domain.RetryPolicy;
 import java.time.Duration;
 import java.time.Instant;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.Optional;
 
 /**
- * One link's archiving attempt, and its retries. SPEC-001 R10, R14-R16, R20.
+ * One link, preserved. SPEC-001 R48–R56, and open decision A.
  *
- * <p>The retry is the port's own rule, not the source's (SPEC-001 Â§4 A): the source marks a link
- * preserved in the same block that reports the failure, so a link that failed is indistinguishable
- * afterwards from one that had nothing to preserve. Here the attempt is retried up to the policy's
- * limit and only the exhausted case marks the link, which means the marking in {@code finish} is
- * reached by both routes and is the same write either way.
+ * <p>The original writes its finishing instant on the failing path as well as the succeeding one,
+ * which takes a failed link out of the selector for good. This port makes three further attempts,
+ * five, ten and twenty seconds apart, and then writes the same terminal state — so a caller
+ * watching only the end sees what the original produces, and one watching the middle sees more.
  */
 @Component(id = "link-archive")
-public class LinkArchiveWorkflow extends Workflow<LinkArchiveWorkflow.Attempting> {
+public class LinkArchiveWorkflow extends Workflow<LinkArchiveWorkflow.State> {
+
+  /** @param attempt how many attempts have been made, counting from one */
+  public record State(int linkId, int attempt, String status, String failedAfter) {}
+
+  private final ComponentClient componentClient;
+  private final Fetcher fetcher;
+  private final Data data;
+
+  public LinkArchiveWorkflow(
+      ComponentClient componentClient, Fetcher fetcher, Data data) {
+    this.componentClient = componentClient;
+    this.fetcher = fetcher;
+    this.data = data;
+  }
+
+  @Override
+  public WorkflowSettings settings() {
+    return WorkflowSettings.builder().defaultStepTimeout(ofSeconds(60)).build();
+  }
 
   /**
-   * @param attemptsMade how many attempts have already run and failed. The wait before the next
-   *     one is derived from this rather than stored, so a resumed workflow computes the same wait
-   *     the interrupted one would have.
+   * Starts one run.
+   *
+   * <p>A workflow instance is one run rather than one link: a completed workflow cannot be
+   * transitioned again, so a link asked to be preserved a second time gets an instance of its own
+   * and this refuses only a second start of the same one.
    */
-  public record Attempting(
-      String linkId, PageFacts facts, int attemptsMade, String lastFailure, boolean finished) {}
-
-  public record Start(String linkId, PageFacts facts) {}
-
-  private static final Logger logger = LoggerFactory.getLogger(LinkArchiveWorkflow.class);
-
-  private final ComponentClient client;
-  private final RetryPolicy policy;
-
-  public LinkArchiveWorkflow(ComponentClient client, Config config) {
-    this.client = client;
-    // The base wait is configuration so that a test can exercise the real retry path in a
-    // reasonable time; the arithmetic over it is the same code either way.
-    this.policy =
-        new RetryPolicy(
-            config.hasPath("linkwarden.retry.max-attempts")
-                ? config.getInt("linkwarden.retry.max-attempts")
-                : RetryPolicy.DEFAULT.maxAttempts(),
-            config.hasPath("linkwarden.retry.base-delay")
-                ? config.getDuration("linkwarden.retry.base-delay")
-                : RetryPolicy.DEFAULT.baseDelay());
-  }
-
-  public Effect<Done> start(Start cmd) {
+  public Effect<String> start(Integer linkId) {
+    if (currentState() != null) return effects().reply("already running");
     return effects()
-        .updateState(new Attempting(cmd.linkId(), cmd.facts(), 0, null, false))
-        .transitionTo(LinkArchiveWorkflow::attempt)
-        .thenReply(Done.getInstance());
+        .updateState(new State(linkId, 0, "running", null))
+        .transitionTo(LinkArchiveWorkflow::attemptStep)
+        .thenReply("started");
   }
 
-  public ReadOnlyEffect<Attempting> state() {
+  public ReadOnlyEffect<State> status() {
+    if (currentState() == null) return effects().error("Nothing archived under this identifier.");
     return effects().reply(currentState());
   }
 
-  public StepEffect attempt() {
-    var state = currentState();
-    var status = client.forEventSourcedEntity(state.linkId()).method(LinkEntity::status).invoke();
+  /** The handler the pause between attempts hands back to. */
+  public Effect<Done> resume() {
+    return effects()
+        .transitionTo(LinkArchiveWorkflow::attemptStep)
+        .thenReply(Done.getInstance());
+  }
 
-    // R16 — a link that is already gone is not attempted at all; finish is where the removal
-    // is decided, and it decides the same way whether the link went before or during.
-    if (status.link().deleted()) {
-      return stepEffects().thenTransitionTo(LinkArchiveWorkflow::finish);
+  @StepName("attempt")
+  private StepEffect attemptStep() {
+    State state = currentState();
+    int attempt = state.attempt() + 1;
+    Optional<Records.Link> found = data.link(state.linkId());
+    if (found.isEmpty()) {
+      return stepEffects().updateState(new State(state.linkId(), attempt, "done", "gone")).thenEnd();
     }
+    Records.Link link = found.get();
+    Instant now = Instant.now();
 
-    var outcome = AttemptRunner.run(status.link(), state.facts());
+    ArchivalSettings settings = settingsFor(link);
+    AttemptSubject subject =
+        AttemptSubject.of(
+            link.id(),
+            link.collectionId(),
+            link.url(),
+            new PreservedFormats(
+                link.image(), link.pdf(), link.readable(), link.monolith(), link.preview()),
+            settings);
+    PageFacts facts = fetcher.facts(link.url());
+    AttemptRunner.Outcome outcome = AttemptRunner.run(subject, facts);
 
     for (AttemptRunner.Write write : outcome.writes()) {
-      switch (write) {
-        case AttemptRunner.Write.Type w ->
-            client
-                .forEventSourcedEntity(state.linkId())
-                .method(LinkEntity::determineType)
-                .invoke(w.type());
-        case AttemptRunner.Write.Meta w ->
-            client
-                .forEventSourcedEntity(state.linkId())
-                .method(LinkEntity::setMetaDescription)
-                .invoke(w.description());
-        case AttemptRunner.Write.Text w ->
-            client
-                .forEventSourcedEntity(state.linkId())
-                .method(LinkEntity::extractText)
-                .invoke(w.text());
-        case AttemptRunner.Write.Preserved w ->
-            client
-                .forEventSourcedEntity(state.linkId())
-                .method(LinkEntity::preserveFormat)
-                .invoke(new LinkEntity.Preserve(w.format(), w.path()));
-      }
+      apply(link.id(), write, now);
     }
 
-    int attemptsMade = state.attemptsMade() + 1;
-
-    if (outcome.failedAfter() == null) {
+    if (outcome.failedAfter() != null && attempt < RetryPolicy.DEFAULT.maxAttempts()) {
+      // Five, ten, then twenty seconds. Each attempt starts from whatever the last one managed
+      // to write, so a run that got as far as the screenshot does not take it again.
+      Duration wait =
+          RetryPolicy.DEFAULT.baseDelay().multipliedBy(1L << (attempt - 1));
       return stepEffects()
-          .updateState(new Attempting(state.linkId(), state.facts(), attemptsMade, null, false))
-          .thenTransitionTo(LinkArchiveWorkflow::finish);
+          .updateState(new State(state.linkId(), attempt, "retrying", outcome.failedAfter()))
+          .thenPause(
+              pauseSetting(wait)
+                  .reason("waiting " + wait.toSeconds() + "s before attempt " + (attempt + 1))
+                  .timeoutHandler(LinkArchiveWorkflow::resume));
     }
 
-    // R20 — a failure keeps the link unmarked while attempts remain, which is the whole of the
-    // difference from the source: there, the marking happens on the way out of the failure.
-    if (policy.hasAnotherAttempt(attemptsMade)) {
-      Duration wait = policy.delayBefore(attemptsMade + 1);
-      logger.info(
-          "link {} attempt {} failed after {}; next attempt in {}",
-          state.linkId(),
-          attemptsMade,
-          outcome.failedAfter(),
-          wait);
-      return stepEffects()
-          .updateState(
-              new Attempting(
-                  state.linkId(), state.facts(), attemptsMade, outcome.failedAfter(), false))
-          .thenTransitionTo(LinkArchiveWorkflow::waitToRetry)
-          .withInput(wait);
-    }
-
-    logger.info(
-        "link {} gave up after {} attempts, last failure {}",
-        state.linkId(),
-        attemptsMade,
-        outcome.failedAfter());
+    // R53 — the finishing instant is written whatever the outcome, and every format still
+    // absent reads unavailable, so a link is never offered to the pipeline twice.
+    componentClient
+        .forKeyValueEntity(Ids.link(link.id()))
+        .method(LinkEntity::finishPreservation)
+        .invoke(new LinkEntity.Finish(now));
     return stepEffects()
-        .updateState(
-            new Attempting(
-                state.linkId(), state.facts(), attemptsMade, outcome.failedAfter(), false))
-        .thenTransitionTo(LinkArchiveWorkflow::finish);
-  }
-
-  public StepEffect waitToRetry(Duration wait) {
-    timers()
-        .createSingleTimer(
-            "retry-" + currentState().linkId(),
-            wait,
-            client
-                .forWorkflow(commandContext().workflowId())
-                .method(LinkArchiveWorkflow::retryNow)
-                .deferred());
-    return stepEffects().thenPause();
-  }
-
-  public Effect<Done> retryNow() {
-    return effects().transitionTo(LinkArchiveWorkflow::attempt).thenReply(Done.getInstance());
-  }
-
-  /**
-   * R15 and R16. The entity answers whether the link was still there; a link that was not has its
-   * files removed instead of being marked.
-   */
-  public StepEffect finish() {
-    var state = currentState();
-    boolean stillThere =
-        client
-            .forEventSourcedEntity(state.linkId())
-            .method(LinkEntity::finishAttempt)
-            .invoke(Instant.now());
-    if (!stillThere) {
-      logger.info("link {} was deleted while it was being archived; files removed", state.linkId());
-    }
-    return stepEffects()
-        .updateState(
-            new Attempting(
-                state.linkId(), state.facts(), state.attemptsMade(), state.lastFailure(), true))
+        .updateState(new State(state.linkId(), attempt, "done", outcome.failedAfter()))
         .thenEnd();
+  }
+
+  /** SPEC-001 R50 — the union of the link's archival tags, or the owner's own five settings. */
+  private ArchivalSettings settingsFor(Records.Link link) {
+    Records.User owner =
+        data.collection(link.collectionId())
+            .flatMap(collection -> data.user(collection.ownerId()))
+            .orElse(null);
+    ArchivalSettings ownerSettings =
+        owner == null ? ArchivalSettings.NONE : owner.archivalSettings();
+    return ArchivalSettingsResolver.resolve(
+        data.tagsOf(link).stream().map(Records.Tag::asArchivalTag).toList(), ownerSettings);
+  }
+
+  private void apply(int linkId, AttemptRunner.Write write, Instant now) {
+    switch (write) {
+      case AttemptRunner.Write.Type type ->
+          componentClient
+              .forKeyValueEntity(Ids.link(linkId))
+              .method(LinkEntity::setType)
+              .invoke(new LinkEntity.SetType(nameOf(type.type()), now));
+      case AttemptRunner.Write.Meta meta ->
+          componentClient
+              .forKeyValueEntity(Ids.link(linkId))
+              .method(LinkEntity::setText)
+              .invoke(new LinkEntity.SetText(meta.description(), null, now));
+      case AttemptRunner.Write.Text text ->
+          componentClient
+              .forKeyValueEntity(Ids.link(linkId))
+              .method(LinkEntity::setText)
+              .invoke(new LinkEntity.SetText(null, text.text(), now));
+      case AttemptRunner.Write.Preserved preserved ->
+          componentClient
+              .forKeyValueEntity(Ids.link(linkId))
+              .method(LinkEntity::preserve)
+              .invoke(new LinkEntity.Preserve(preserved.format(), preserved.path(), now));
+    }
+  }
+
+  private static String nameOf(LinkType type) {
+    return switch (type) {
+      case PDF -> "pdf";
+      case IMAGE -> "image";
+      case URL -> "url";
+    };
   }
 }

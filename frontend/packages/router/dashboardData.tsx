@@ -7,14 +7,15 @@ import { anyPreservationPending } from "@linkwarden/lib/formatStats";
 import { PRESERVATION_POLL_INTERVAL } from "./links";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "next-auth/react";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 /**
- * Where this screen's data comes from. The archiving pipeline behind it was rebuilt on
- * Akka; everything else on the page is unchanged and still served by this application.
+ * Where this screen's data comes from. It is a subscription rather than a repeated request:
+ * the address is on this application's own origin, so the session's token is attached to it
+ * the same way it is to every other call, which a subscription cannot do for itself.
  */
 const DASHBOARD_STREAM_URL =
-  process.env.NEXT_PUBLIC_DASHBOARD_STREAM_URL || "http://localhost:9077/dashboard/stream";
+  process.env.NEXT_PUBLIC_DASHBOARD_STREAM_URL || "/api/v2/dashboard/stream";
 
 const useDashboardData = (auth?: MobileAuth) => {
   let status: "loading" | "authenticated" | "unauthenticated";
@@ -27,6 +28,26 @@ const useDashboardData = (auth?: MobileAuth) => {
   }
 
   const queryClient = useQueryClient();
+
+  // The first message answers the query; every message after it updates the cache in place.
+  // Kept apart because a query whose function never resolves stays "loading" for ever, and a
+  // query whose function resolves with a placeholder overwrites whatever the first message
+  // had already put there — one of the two happens whichever way round they are wired.
+  const firstMessage = useRef<any>(null);
+  const waitingForFirst = useRef<((payload: any) => void) | null>(null);
+
+  const deliver = (payload: any) => {
+    if (waitingForFirst.current) {
+      waitingForFirst.current(payload);
+      waitingForFirst.current = null;
+      return;
+    }
+    if (firstMessage.current === null) {
+      firstMessage.current = payload;
+      return;
+    }
+    queryClient.setQueryData(["dashboardData"], payload);
+  };
 
   // The dashboard's data arrives on a subscription rather than on a repeated request.
   // The connection is opened once and held; the server sends a message whenever what this
@@ -43,8 +64,7 @@ const useDashboardData = (auth?: MobileAuth) => {
       if (closed) return;
       source = new EventSource(DASHBOARD_STREAM_URL);
       source.onmessage = (event) => {
-        const payload = JSON.parse(event.data);
-        queryClient.setQueryData(["dashboardData"], payload.data);
+        deliver(JSON.parse(event.data).data);
       };
       source.onerror = () => {
         source?.close();
@@ -65,21 +85,21 @@ const useDashboardData = (auth?: MobileAuth) => {
 
   return useQuery({
     queryKey: ["dashboardData"],
-    // There is no request to make: the subscription above is the only route to this data.
-    // Until the first message arrives the page is given an empty dashboard rather than
-    // nothing, because it reads through the shape rather than checking for it.
-    queryFn: async () => ({
-      links: [],
-      pinnedLinks: [],
-      collectionLinks: {},
-      numberOfLinks: 0,
-      numberOfCollections: 0,
-      numberOfTags: 0,
-      numberOfPinnedLinks: 0,
-      dashboardSections: [],
-    }),
+    // There is no request to make: the subscription above is the only route to this data, so
+    // this waits for the message that has arrived, or for the next one.
+    queryFn: () =>
+      new Promise<any>((resolve) => {
+        if (firstMessage.current !== null) {
+          const payload = firstMessage.current;
+          firstMessage.current = {};
+          resolve(payload);
+          return;
+        }
+        waitingForFirst.current = resolve;
+      }),
     enabled: status === "authenticated",
     staleTime: Infinity,
+    retry: false,
   });
 };
 

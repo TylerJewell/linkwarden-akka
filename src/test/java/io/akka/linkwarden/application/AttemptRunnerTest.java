@@ -5,12 +5,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.akka.linkwarden.domain.ArchivalSettings;
-import io.akka.linkwarden.domain.Link;
+import io.akka.linkwarden.domain.ArchivalSettingsResolver;
+import io.akka.linkwarden.domain.AttemptSubject;
 import io.akka.linkwarden.domain.LinkType;
 import io.akka.linkwarden.domain.PageFacts;
 import io.akka.linkwarden.domain.PreservedFormats;
 import io.akka.linkwarden.domain.Tag;
-import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -21,9 +21,9 @@ class AttemptRunnerTest {
   private static final ArchivalSettings ALL_ON =
       new ArchivalSettings(true, true, true, true, true, true);
 
-  private static Link link(PreservedFormats formats, String url, List<Tag> tags) {
-    return Link.saved("1", "A link", url, "7", "3", tags, ALL_ON, Instant.parse("2026-01-01T00:00:00Z"))
-        .withFormats(formats);
+  private static AttemptSubject link(PreservedFormats formats, String url, List<Tag> tags) {
+    return AttemptSubject.of(
+        1, 7, url, formats, ArchivalSettingsResolver.resolve(tags, ALL_ON));
   }
 
   private static List<io.akka.linkwarden.domain.Format> formatsWritten(

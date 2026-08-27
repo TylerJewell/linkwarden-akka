@@ -1,6 +1,6 @@
 package io.akka.linkwarden.domain;
 
-/** SPEC-001 R1 and R17 — the two questions that decide whether a link is offered at all. */
+/** SPEC-001 R48 and R57 — the two questions that decide whether a link is offered at all. */
 public final class Eligibility {
 
   public static final int CURRENT_INDEX_VERSION = 1;

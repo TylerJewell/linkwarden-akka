@@ -2,7 +2,7 @@ package io.akka.linkwarden.domain;
 
 import java.util.List;
 
-/** SPEC-001 R5 — tags decide, or the owner does; never a blend of the two. */
+/** SPEC-001 R50 — tags decide, or the owner does; never a blend of the two. */
 public final class ArchivalSettingsResolver {
 
   private ArchivalSettingsResolver() {}

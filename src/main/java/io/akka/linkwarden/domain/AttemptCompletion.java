@@ -15,7 +15,7 @@ public final class AttemptCompletion {
 
   private AttemptCompletion() {}
 
-  public static Outcome decide(Link link) {
+  public static Outcome decide(AttemptSubject link) {
     return link == null || link.deleted() ? Outcome.REMOVE_FILES : Outcome.MARK_UNAVAILABLE;
   }
 }

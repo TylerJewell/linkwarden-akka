@@ -1,6 +1,6 @@
 package io.akka.linkwarden.domain;
 
-/** SPEC-001 R5 — the six switches that decide which formats an attempt tries. */
+/** SPEC-001 R50 — the six switches that decide which formats an attempt tries. */
 public record ArchivalSettings(
     boolean archiveAsScreenshot,
     boolean archiveAsMonolith,

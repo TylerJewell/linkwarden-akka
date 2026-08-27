@@ -10,9 +10,9 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * SPEC-001 R2-R4 — how one archiving batch is shared between owners.
+ * SPEC-001 R49 — how one archiving batch is shared between owners.
  *
- * <p>The result carries the stamped owners alongside the picked links because R4 stamps every
+ * <p>The result carries the stamped owners alongside the picked links because the rule stamps every
  * owner who had an eligible link, including ones whose links did not make the batch: keeping the
  * two in one record is what stops the second being derived from the first.
  */
@@ -33,7 +33,7 @@ public final class BatchSelection {
       return new Batch(List.of(), List.of());
     }
 
-    // R2 — owners ordered by when they were last picked, never-picked first, then by id.
+    // R49 — owners ordered by when they were last picked, never-picked first, then by id.
     Map<String, Instant> ownerLastPicked = new LinkedHashMap<>();
     for (Candidate c : eligible) {
       ownerLastPicked.putIfAbsent(c.ownerId(), c.ownerLastPickedAt());
@@ -48,7 +48,7 @@ public final class BatchSelection {
             .limit(maxBatchLinks)
             .toList();
 
-    // R3 — newest-created first within an owner.
+    // R49 — newest-created first within an owner.
     Map<String, List<Candidate>> byOwner = new LinkedHashMap<>();
     for (String owner : owners) {
       byOwner.put(
@@ -95,7 +95,7 @@ public final class BatchSelection {
       }
     }
 
-    // R4 — stamped by having had an eligible link, not by having contributed to the batch.
+    // R49 — stamped by having had an eligible link, not by having contributed to the batch.
     List<String> stamped = new ArrayList<>(owners);
     return new Batch(List.copyOf(picked), List.copyOf(stamped));
   }

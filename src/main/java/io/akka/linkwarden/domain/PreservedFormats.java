@@ -3,7 +3,7 @@ package io.akka.linkwarden.domain;
 /**
  * The five per-format outcomes. Each is a stored path, the literal {@link #UNAVAILABLE}, or
  * absent — and {@code UNAVAILABLE} is a value rather than an absence, which is why three of the
- * five treat it as already answered and two do not (SPEC-001 R7, R8).
+ * five treat it as already answered and two do not (SPEC-001 R52).
  */
 public record PreservedFormats(
     String image, String pdf, String readable, String monolith, String preview) {

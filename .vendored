@@ -1,0 +1,2 @@
+frontend/            # linkwarden's own web interface, copied whole and repointed (RENDERING.md R3)
+target/              # what the build wrote

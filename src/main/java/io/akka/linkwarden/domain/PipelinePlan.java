@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * SPEC-001 R7-R11 — which steps this attempt runs, in the order it runs them. Deciding the whole
+ * SPEC-001 R51 — which steps this attempt runs, in the order it runs them. Deciding the whole
  * plan up front rather than at each branch is what makes the order comparable against the
  * original one workload at a time.
  */

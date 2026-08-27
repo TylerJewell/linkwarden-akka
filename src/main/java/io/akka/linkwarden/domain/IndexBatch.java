@@ -6,7 +6,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 
 /**
- * SPEC-001 R18 — half the batch oldest-first and half newest-first, duplicates dropped by id.
+ * SPEC-001 R57 — half the batch oldest-first and half newest-first, duplicates dropped by id.
  * A batch of one therefore holds only the newest, and a batch asking for more than exists holds
  * the overlap once.
  */
