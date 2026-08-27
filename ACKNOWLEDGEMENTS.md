@@ -508,6 +508,16 @@ sentence each was given then still holds.
 - `image/jpeg` — a media type registered with IANA. Both systems read the same header from the
   same web.
 
+### Four that are the same word in both and were not copied
+
+- `statusCode` — the field `searchLinks` returns its status under, and the field the rebuild's
+  dashboard answers under, because a client reading one reads the other. It is a field name on
+  the wire.
+- `completion`, `eligibility`, `contentType` — three keys in the benchmark's own workload file,
+  which both sides read. They are the names of the questions being asked, chosen so that the
+  two answer files can be compared line by line, and neither side took them from the other's
+  source.
+
 ## What was not taken
 
 - No file under `src/` came from linkwarden.
