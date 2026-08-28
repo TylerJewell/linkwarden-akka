@@ -1,0 +1,23 @@
+linkwarden-akka
+Copyright 2026 Tyler Jewell
+
+This software was written for the Akka Specify port experiment and is licensed
+under the Apache License, Version 2.0. See LICENSE.
+
+It is a clean-room implementation: written against a specification derived by
+running linkwarden/linkwarden and recording what it does, not by translating its source.
+
+Portions of this repository are NOT covered by that licence. The following trees
+are reused verbatim from linkwarden/linkwarden (https://github.com/linkwarden/linkwarden):
+
+    frontend/
+
+    Copyright the linkwarden/linkwarden authors
+    Licensed under AGPL-3.0
+
+Those files remain under the licence their authors chose. Nothing in this
+repository relicenses them. See LICENSING.md and .vendored.
+
+Installed dependencies inside those trees (node_modules)
+are neither this project's work nor linkwarden/linkwarden's. Each package
+there remains under the licence its own author chose.
